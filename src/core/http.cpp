@@ -319,81 +319,15 @@ HttpServer::collect_self_stats(HttpConnection *conn)
           Logger::http("Recved request on %p: len=%d\n%s", fd, conn, len, buff);
 
           /* ----------  Parse and process all complete requests  ---------- */
-          conn_error = false;                         // reset error flag for this pass
-          size_t processed = 0;                       // bytes consumed so far
-          size_t remaining = len;                     // bytes still in buff
-
-          /* Helper that finds the end of a header (\r\n\r\n) when there is no body.
-             Must NOT use strstr: parse_header NUL-terminates fields in-place,
-             so strstr stops at the first \0 and never reaches \r\n\r\n. */
-          auto find_header_end = [&](size_t offset) -> size_t {
-              for (size_t i = 0; i + 3 < remaining; i++) {
-                  if (buff[offset+i]   == '\r' && buff[offset+i+1] == '\n' &&
-                      buff[offset+i+2] == '\r' && buff[offset+i+3] == '\n')
-                      return i + 4;
-              }
-              return (size_t)0;
-          };
-
-          while (true)
-          {
-              /* ----- parse one request --------------------------------- */
-              parse_header(buff + processed, remaining, conn->request);
-
-              if (!conn->request.header_ok)
-                  break;                     // incomplete header
-
-              if (!conn->request.is_complete())   // body missing
-              {
-                  processed = remaining;
-                  break;
-              }
-
-              /* ----- compute request size ----------------------------- */
-              size_t req_len = conn->request.length;
-              size_t header_offset = conn->request.content
-                                         ? (size_t)(conn->request.content - (buff + processed))
-                                         : 0;
-              size_t delta = header_offset + req_len;
-
-              /* header‑only request – find the end of the header explicitly */
-              if (!conn->request.content && req_len == 0)
-                  delta = find_header_end(processed);
-
-              /* if we cannot determine a valid request size or it exceeds
-                 the remaining data, abort parsing to avoid an out‑of‑bounds memmove. */
-              if (delta == 0 || delta > remaining)
-              {
-                  Logger::warn("request size %zu exceeds remaining %zu", delta, remaining);
-                  processed = remaining;
-                  remaining = 0;
-                  break;
-              }
-              /* ---------------------------------------------------------- */
-
-              /* ----- process request ------------------------------------- */
-              process_request(conn->request, conn->response);
-              conn->pending_responses.push_back(std::move(conn->response));
-
-              /* ----- try to send queued responses immediately ------------- */
-              if (!HttpServer::send_response(conn))   // partial send
-              {
-                  processed += delta;
-                  remaining -= delta;
-                  break;
-              }
-
-              /* ----- move to next request in the buffer ------------------- */
-              processed += delta;
-              remaining -= delta;
-              conn->request.init();                 // prepare for the next one
-          }
+          conn_error = false;
+          size_t consumed  = HttpServer::process_requests(buff, len, conn);
+          size_t remaining = len - consumed;
 
           /* ----------  Update buffer state ---------------------------- */
           if (remaining > 0)
           {
-              if (processed > 0)
-                  memmove(buff, buff + processed, remaining);
+              if (consumed > 0)
+                  memmove(buff, buff + consumed, remaining);
               conn->buff   = buff;
               conn->offset = remaining;
               free_buff = false;
@@ -513,40 +447,75 @@ HttpServer::recv_http_data_cont(HttpConnection *conn)
 
         if (! conn->request.header_ok)
         {
+            // Header not yet fully parsed: undo any partial NUL-terminations,
+            // then let process_requests parse+process all complete requests.
             undo_header(conn->request);
-            Logger::http("Re-parse request: %s", fd, buff);
-            parse_header(buff, len, conn->request);
-        }
-
-        conn->response.id = conn->request.id;
-
-        if (conn->request.header_ok)
-        {
-            conn->request.complete =
-                (conn->request.length <= ((uint64_t)&buff[len] - (uint64_t)conn->request.content));
-        }
-
-        // Check if we have recv'ed the complete request.
-        // If not, we need to stop right here, and inform
-        // the listener to forward the rest of the request
-        // our way.
-        if (UNLIKELY(! conn->request.is_complete()))
-        {
-            free_buff = false;
-            conn->offset = len;
-            Logger::http("request.length = %d, len = %d, offset = %d", fd,
-                conn->request.length, len, conn->offset);
-        }
-        else if (UNLIKELY(! conn->request.header_ok))
-        {
-            free_buff = HttpServer::send_response(conn, 400);
+            Logger::http("Re-parse via process_requests: %s", fd, buff);
+            size_t consumed = HttpServer::process_requests(buff, len, conn);
+            size_t remaining = (size_t)len - consumed;
+            if (remaining > 0)
+            {
+                if (consumed > 0)
+                    memmove(buff, buff + consumed, remaining);
+                conn->offset = remaining;
+                free_buff = false;
+            }
+            else
+            {
+                free_buff = conn->pending_responses.empty();
+            }
         }
         else
         {
-            Logger::debug("request is finally complete");
-            process_request(conn->request, conn->response);
-            conn->pending_responses.push_back(std::move(conn->response));
-            free_buff = HttpServer::send_response(conn);
+            // Header was fully parsed on a previous call; only the body was missing.
+            conn->request.complete =
+                (conn->request.length <= ((uint64_t)&buff[len] - (uint64_t)conn->request.content));
+            conn->response.id = conn->request.id;
+
+            if (UNLIKELY(! conn->request.is_complete()))
+            {
+                free_buff = false;
+                conn->offset = len;
+                Logger::http("request.length = %d, len = %d, offset = %d", fd,
+                    conn->request.length, len, conn->offset);
+            }
+            else
+            {
+                Logger::debug("request is finally complete");
+                process_request(conn->request, conn->response);
+                conn->pending_responses.push_back(std::move(conn->response));
+                HttpServer::send_response(conn);
+
+                // Process any pipelined requests that arrived alongside this one.
+                size_t req_end = conn->request.header_end
+                    ? (size_t)(conn->request.header_end + (size_t)conn->request.length - (size_t)buff)
+                    : (size_t)len;
+
+                if (req_end < (size_t)len)
+                {
+                    size_t rem = (size_t)len - req_end;
+                    memmove(buff, buff + req_end, rem);
+                    buff[rem]   = 0; buff[rem+1] = ' '; buff[rem+2] = 0;
+                    buff[rem+3] = '\r'; buff[rem+4] = 0; buff[rem+5] = ';'; buff[rem+6] = 0;
+                    size_t consumed2 = HttpServer::process_requests(buff, rem, conn);
+                    size_t remaining2 = rem - consumed2;
+                    if (remaining2 > 0)
+                    {
+                        if (consumed2 > 0)
+                            memmove(buff, buff + consumed2, remaining2);
+                        conn->offset = remaining2;
+                        free_buff = false;
+                    }
+                    else
+                    {
+                        free_buff = conn->pending_responses.empty();
+                    }
+                }
+                else
+                {
+                    free_buff = conn->pending_responses.empty();
+                }
+            }
         }
     }
     else
@@ -588,12 +557,43 @@ HttpServer::resend_response(TaskData& data)
     if (g_shutdown_requested) return false;
     HttpConnection *conn = (HttpConnection*)data.pointer;
     bool success = send_response(conn);
-    if (success)
+    if (success && conn->buff != nullptr)
     {
-        if (conn->buff != nullptr)
+        if (conn->offset > 0)
+        {
+            // There are pipelined requests in the buffer that were buffered
+            // while a previous partial send was in progress.  Process them now.
+            char *buff = conn->buff;
+            size_t len  = conn->offset;
+            buff[len]   = 0; buff[len+1] = ' '; buff[len+2] = 0;
+            buff[len+3] = '\r'; buff[len+4] = 0; buff[len+5] = ';'; buff[len+6] = 0;
+            size_t consumed  = HttpServer::process_requests(buff, len, conn);
+            size_t remaining = len - consumed;
+            if (remaining > 0)
+            {
+                if (consumed > 0)
+                    memmove(buff, buff + consumed, remaining);
+                conn->offset = remaining;
+                // conn->buff stays; resend_response will be re-scheduled by send_response
+            }
+            else
+            {
+                // All pipelined requests processed and all responses sent.
+                if (conn->pending_responses.empty())
+                {
+                    MemoryManager::free_network_buffer(buff);
+                    conn->buff   = nullptr;
+                    conn->offset = 0;
+                }
+                // else: send_response returned false on one of the new responses;
+                //       it already scheduled another resend_response via resubmit_by_responder.
+            }
+        }
+        else
         {
             MemoryManager::free_network_buffer(conn->buff);
-            conn->buff = nullptr;
+            conn->buff   = nullptr;
+            conn->offset = 0;
         }
     }
     --conn->pending_tasks;
@@ -657,6 +657,67 @@ HttpServer::get_post_handler(const char *path)
     return search->second;
 }
 
+
+
+// Parse and process as many complete HTTP requests as possible from buff[0..len).
+// For each complete request: sets conn->response.id, calls process_request,
+// pushes to pending_responses, calls send_response.
+// Stops when: incomplete header, incomplete body, or send_response returns false.
+// Returns the number of bytes consumed (0..len).
+size_t
+HttpServer::process_requests(char *buff, size_t len, HttpConnection *conn)
+{
+    size_t processed = 0;
+    size_t remaining = len;
+
+    auto find_header_end = [&](size_t offset) -> size_t {
+        for (size_t i = 0; i + 3 < remaining; i++) {
+            if (buff[offset+i]   == '\r' && buff[offset+i+1] == '\n' &&
+                buff[offset+i+2] == '\r' && buff[offset+i+3] == '\n')
+                return i + 4;
+        }
+        return (size_t)0;
+    };
+
+    while (remaining > 0)
+    {
+        conn->request.init();
+        parse_header(buff + processed, remaining, conn->request);
+
+        if (!conn->request.header_ok)
+            break;
+
+        if (!conn->request.is_complete())
+            break;
+
+        size_t req_len    = conn->request.length;
+        size_t header_off = conn->request.content
+                                ? (size_t)(conn->request.content - (buff + processed))
+                                : 0;
+        size_t delta = header_off + req_len;
+
+        if (!conn->request.content && req_len == 0)
+            delta = find_header_end(processed);
+
+        if (delta == 0 || delta > remaining)
+        {
+            Logger::warn("request size %zu exceeds remaining %zu", delta, remaining);
+            break;
+        }
+
+        conn->response.id = conn->request.id;
+        process_request(conn->request, conn->response);
+        conn->pending_responses.push_back(std::move(conn->response));
+
+        processed += delta;
+        remaining -= delta;
+
+        if (!HttpServer::send_response(conn))
+            break;
+    }
+
+    return processed;
+}
 
 
 bool HttpServer::send_response(HttpConnection *conn)
@@ -804,7 +865,7 @@ HttpServer::parse_header(char *buff, int len, HttpRequest& request)
     }
 
     if (*curr1 == '\r') curr1++;
-    if (*curr1 == '\n') { curr1++; request.header_ok = true; }
+    if (*curr1 == '\n') { curr1++; request.header_ok = true; request.header_end = curr1; }
 
     // parse body
     if (request.header_ok)
@@ -1253,6 +1314,7 @@ HttpRequest::init()
     encoding = 0;
     content = nullptr;
     id = nullptr;
+    header_end = nullptr;
     length = 0;
     complete = false;
     forward = g_cluster_enabled;

@@ -115,8 +115,9 @@ public:
     char *params;   // q=abc
     char *version;  // HTTP/1.1
     char *content;  // body
-    char *id;       // X-Request-ID
-    int length;     // Content-Length
+    char *id;           // X-Request-ID
+    char *header_end;   // pointer to first byte after the header (\r\n\r\n)
+    int length;         // Content-Length
     bool complete;
     bool forward;
     bool header_ok; // header parsed ok?
@@ -206,6 +207,7 @@ private:
     static void undo_header(HttpRequest& request);
     static bool parse_header(char *buff, int len, HttpRequest& request);
     static bool process_request(HttpRequest& request, HttpResponse& response);
+    static size_t process_requests(char *buff, size_t len, HttpConnection *conn);
     static bool send_response(HttpConnection *conn);
     static bool send_response(HttpConnection *conn, uint16_t status);
 
